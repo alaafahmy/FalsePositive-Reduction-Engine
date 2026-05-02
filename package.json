@@ -1,0 +1,68 @@
+{
+  "name": "zerofalse",
+  "displayName": "ZeroFalse — SAST False Positive Reduction",
+  "description": "Reduces false positives in CodeQL SARIF output using LLM-based adjudication (ZeroFalse framework).",
+  "version": "1.0.0",
+  "publisher": "zerofalse",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "zerofalse-sidebar",
+          "title": "ZeroFalse",
+          "icon": "$(shield)"
+        }
+      ]
+    },
+    "views": {
+      "zerofalse-sidebar": [
+        {
+          "type": "webview",
+          "id": "zerofalse.resultsView",
+          "name": "Analysis Results"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "zerofalse.analyze",
+        "title": "ZeroFalse: Analyze SARIF File",
+        "category": "ZeroFalse"
+      },
+      {
+        "command": "zerofalse.clearAnnotations",
+        "title": "ZeroFalse: Clear Annotations",
+        "category": "ZeroFalse"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "zerofalse.analyze",
+          "when": "resourceExtname == .sarif",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.3.0"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  }
+}
