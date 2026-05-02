@@ -1,0 +1,9 @@
+{
+    "java.configuration.updateBuildConfiguration": "interactive",
+    "files.watcherExclude": {
+        "**/db-codeql/**": true
+    },
+    "search.exclude": {
+        "**/db-codeql/**": true
+    }
+}
