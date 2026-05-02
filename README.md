@@ -47,6 +47,13 @@ CodeQL → SARIF → Context Extraction → LLM → Classification → VS Code U
 
 ---
 
+## Current Limitations
+
+- The extension currently supports Java only  
+- Execution is limited to development mode (not yet packaged for marketplace)
+
+---
+
 ## Requirements
 
 ### 1. Visual Studio Code
@@ -57,7 +64,7 @@ CodeQL → SARIF → Context Extraction → LLM → Classification → VS Code U
 ### 2. Node.js
 - Version 18 or higher  
 
-Verify installation:
+Verify installation:  
 node -v  
 npm -v  
 
@@ -66,18 +73,18 @@ npm -v
 ### 3. CodeQL CLI
 - Installed and configured in system PATH  
 
-Verify installation:
+Verify installation:  
 codeql version  
 
 ---
 
 ### 4. Large Language Model (LLM)
 
-Local Model (Recommended):
+Local Model (Recommended):  
 - Install Ollama  
 - Pull a model such as llama3  
 
-Commands:
+Commands:  
 ollama pull llama3  
 ollama run llama3  
 
@@ -97,13 +104,22 @@ npm run compile
 
 ## Usage
 
-1. Run CodeQL analysis on your target project  
-2. Export the results as a .sarif file  
-3. Open the project in Visual Studio Code  
-4. Load the SARIF file  
-5. Run the command:  
+### Running the Extension (Development Mode)
+
+1. Open the project in Visual Studio Code  
+2. Open the file extension.ts  
+3. Press F5 to launch the Extension Development Host  
+4. A new VS Code window will open  
+
+---
+
+### Running Analysis
+
+1. In the new window, open the project or folder that contains the dataset to be analyzed  
+2. Ensure the dataset (e.g., SARIF file) is available  
+3. Run the command:  
    ZeroFalse: Analyze SARIF File  
-6. View refined results inside the extension interface  
+4. View refined results inside the extension interface  
 
 ---
 
