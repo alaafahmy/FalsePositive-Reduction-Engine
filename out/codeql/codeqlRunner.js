@@ -68,6 +68,7 @@ const path = __importStar(require("path"));
 const fs = __importStar(require("fs"));
 const https = __importStar(require("https"));
 const os = __importStar(require("os"));
+const extension_1 = require("../extension");
 // ---------------------------------------------------------------------------
 // Module-level: path set by installCodeQL() for the remainder of the session.
 // ---------------------------------------------------------------------------
@@ -272,165 +273,254 @@ function resolveJavaSecuritySuite(codeqlExe) {
  *   6. Return absolute path to results.sarif.
  *
  * @param workspacePath - Absolute path to the root of the Java project.
+ * @param isCancelled - Optional callback to check for cancellation
  * @returns Absolute path to the generated results.sarif file.
  * @throws Error with descriptive message on any failure.
  */
-async function runCodeQLAnalysis(workspacePath) {
-    return await vscode.window.withProgress({
-        location: vscode.ProgressLocation.Notification,
-        title: "ZeroFalse: Running CodeQL Analysis",
-        cancellable: false,
-    }, async (progress) => {
-        // ------------------------------------------------------------------
-        // Step 0: Detect CodeQL executable
-        // ------------------------------------------------------------------
-        const codeqlExe = detectCodeQL();
-        if (!codeqlExe) {
-            const msg = "CodeQL was not found. Please install it and ensure it is on PATH, " +
-                "or place it at C:\\codeql\\codeql.exe.";
-            vscode.window.showErrorMessage(`ZeroFalse: ${msg}`);
-            throw new Error(msg);
-        }
-        console.log(`[ZeroFalse] Using CodeQL executable: ${codeqlExe}`);
-        const dbPath = path.join(workspacePath, "db-codeql");
-        const sarifPath = path.join(workspacePath, "results.sarif");
-        // ------------------------------------------------------------------
-        // Step 1: Cleanup — remove stale artifacts before running
-        // ------------------------------------------------------------------
-        progress.report({ message: "Cleaning up previous analysis artifacts…" });
-        if (fs.existsSync(dbPath)) {
-            console.log(`[ZeroFalse] Removing existing CodeQL database at: ${dbPath}`);
-            fs.rmSync(dbPath, { recursive: true, force: true });
-        }
-        if (fs.existsSync(sarifPath)) {
-            console.log(`[ZeroFalse] Removing existing SARIF file at: ${sarifPath}`);
-            fs.unlinkSync(sarifPath);
-        }
-        // ------------------------------------------------------------------
-        // Step 2: Create CodeQL database
-        //
-        // IMPORTANT: Use spawnSync with an argument ARRAY, not execSync with a
-        // joined string. When execSync builds "--command=mvn clean compile -Dspotless.skip=true" as
-        // a single string the shell splits it into three tokens at the spaces,
-        // giving CodeQL three unmatched positional arguments. spawnSync passes
-        // each element directly to the OS without any shell interpretation, so
-        // the value of --command stays intact as "mvn clean compile".
-        // ------------------------------------------------------------------
-        progress.report({ message: "Creating CodeQL database (running mvn clean compile)…" });
-        console.log(`[ZeroFalse] Starting CodeQL database creation in: ${workspacePath}`);
-        const dbCreateArgs = [
-            "database", "create",
-            dbPath,
-            "--language=java",
-            "--overwrite",
-            "--threads=0",
-        ];
-        // If the project has a pom.xml use Maven; otherwise let CodeQL autobuild.
-        // NOTE: Do NOT wrap with "cmd /c" here — CodeQL's Java extractor sets up
-        // JAVA_TOOL_OPTIONS / tracer hooks before invoking the build command, and
-        // an extra cmd.exe layer breaks that environment injection, causing the
-        // pre-finalize step to fail because no class files are traced.
-        if (fs.existsSync(path.join(workspacePath, "pom.xml"))) {
-            dbCreateArgs.push("--command");
-            dbCreateArgs.push("mvn clean compile -Dspotless.skip=true -T 1C");
-        }
-        console.log(`[ZeroFalse] DB create: ${codeqlExe} ${dbCreateArgs.join(" ")}`);
-        try {
-            const dbResult = child_process.spawnSync(codeqlExe, dbCreateArgs, {
-                cwd: workspacePath,
-                timeout: 600000, // 10 minutes
-                stdio: "pipe",
+async function runCodeQLAnalysis(workspacePath, progress) {
+    // Helper to run child processes asynchronously with cancellation support
+    const spawnAsync = (command, args, options, timeoutMs) => {
+        return new Promise((resolve, reject) => {
+            if (extension_1.cancellationController.isCancelled) {
+                return reject(new Error("CancelledByUser"));
+            }
+            const cp = child_process.spawn(command, args, options);
+            let stdout = "";
+            let stderr = "";
+            cp.stdout?.on('data', data => stdout += data.toString());
+            cp.stderr?.on('data', data => stderr += data.toString());
+            let isTerminating = false;
+            const handleCancel = async () => {
+                if (isTerminating)
+                    return;
+                isTerminating = true;
+                console.log(`[ZeroFalse] Cancelling CodeQL process: ${command}`);
+                if (cp.pid && cp.exitCode === null && cp.signalCode === null) {
+                    try {
+                        if (os.platform() === 'win32') {
+                            // Safe termination first (without /F)
+                            child_process.execSync(`taskkill /pid ${cp.pid} /T`, { stdio: 'ignore' });
+                        }
+                        else {
+                            cp.kill('SIGTERM');
+                        }
+                    }
+                    catch (e) {
+                        // Ignore kill errors
+                    }
+                    // Wait up to 3 seconds for graceful shutdown
+                    for (let i = 0; i < 30; i++) {
+                        if (cp.exitCode !== null || cp.signalCode !== null)
+                            break;
+                        await new Promise(r => setTimeout(r, 100));
+                    }
+                    // Force kill if still alive
+                    if (cp.exitCode === null && cp.signalCode === null) {
+                        try {
+                            if (os.platform() === 'win32') {
+                                child_process.execSync(`taskkill /pid ${cp.pid} /T /F`, { stdio: 'ignore' });
+                            }
+                            else {
+                                cp.kill('SIGKILL');
+                            }
+                        }
+                        catch (e) {
+                            // Ignore kill errors
+                        }
+                    }
+                }
+            };
+            const cancelDisposable = extension_1.cancellationController.onCancellationRequested(handleCancel);
+            const timeoutId = setTimeout(() => {
+                cancelDisposable.dispose();
+                handleCancel().finally(() => {
+                    reject(new Error(`Timeout after ${timeoutMs}ms`));
+                });
+            }, timeoutMs);
+            cp.on('close', code => {
+                clearTimeout(timeoutId);
+                cancelDisposable.dispose();
+                if (isTerminating || extension_1.cancellationController.isCancelled) {
+                    reject(new Error("CancelledByUser"));
+                }
+                else if (code === 0) {
+                    resolve({ stdout, stderr });
+                }
+                else {
+                    const err = new Error(`Command failed with exit code ${code}`);
+                    err.stdout = stdout;
+                    err.stderr = stderr;
+                    err.status = code;
+                    reject(err);
+                }
             });
-            const dbStdout = dbResult.stdout?.toString() ?? "";
-            const dbStderr = dbResult.stderr?.toString() ?? "";
-            // Always write full output to the Output Channel for diagnostics
-            const ch = getOutputChannel();
-            ch.appendLine("\n=== CodeQL database create ===");
-            ch.appendLine(`Command: ${codeqlExe} ${dbCreateArgs.join(" ")}`);
-            ch.appendLine(`CWD: ${workspacePath}`);
-            if (dbStdout.trim()) {
-                ch.appendLine("[stdout]\n" + dbStdout);
-            }
-            if (dbStderr.trim()) {
-                ch.appendLine("[stderr]\n" + dbStderr);
-            }
-            ch.appendLine(`Exit code: ${dbResult.status}`);
-            if (dbResult.status !== 0 || dbResult.error) {
-                ch.show(true); // bring Output panel to front on failure
-                console.error("[ZeroFalse] CodeQL database creation FAILED");
-                console.error(`[ZeroFalse]   stdout: ${dbStdout.trim()}`);
-                console.error(`[ZeroFalse]   stderr: ${dbStderr.trim()}`);
-                const detail = dbResult.error?.message || dbStderr.trim() || dbStdout.trim() || "unknown error";
-                throw new Error(`CodeQL database creation failed: ${detail.slice(0, 2000)}`);
-            }
-            console.log("[ZeroFalse] CodeQL database creation completed.");
-            if (dbStdout.trim()) {
-                console.log(`[ZeroFalse] DB stdout: ${dbStdout.trim()}`);
-            }
-        }
-        catch (err) {
-            // Re-throw errors we already wrapped; wrap unexpected ones
-            if (err.message.startsWith("CodeQL database creation failed:")) {
-                throw err;
-            }
-            throw new Error(`CodeQL database creation failed: ${err.message}`);
-        }
-        // ------------------------------------------------------------------
-        // Step 3: Analyze — codeql database analyze
-        // ------------------------------------------------------------------
-        // Dynamically resolve the best available security suite for the
-        // installed CodeQL version (avoids hard-coded paths that break
-        // across different qlpack layouts).
-        const javaSuite = resolveJavaSecuritySuite(codeqlExe);
-        progress.report({ message: `Running CodeQL security queries (${javaSuite.split(":").pop()})…` });
-        console.log(`[ZeroFalse] Starting CodeQL analysis with suite: ${javaSuite}`);
-        const analyzeArgs = [
-            "database", "analyze",
-            dbPath,
-            javaSuite,
-            "--format=sarif-latest",
-            "--output", sarifPath,
-            "--download",
-            "--ram=4096", // Allow up to 4GB RAM to prevent swapping
-            "--threads=0", // Use all available cores to maximize speed
-        ];
-        console.log(`[ZeroFalse] Analyze: ${codeqlExe} ${analyzeArgs.join(" ")}`);
-        try {
-            const analyzeResult = child_process.spawnSync(codeqlExe, analyzeArgs, {
-                cwd: workspacePath,
-                timeout: 1200000, // 20 minutes
-                stdio: "pipe",
+            cp.on('error', err => {
+                clearTimeout(timeoutId);
+                cancelDisposable.dispose();
+                if (isTerminating || extension_1.cancellationController.isCancelled) {
+                    reject(new Error("CancelledByUser"));
+                }
+                else {
+                    reject(err);
+                }
             });
-            const anStdout = analyzeResult.stdout?.toString().trim() ?? "";
-            const anStderr = analyzeResult.stderr?.toString().trim() ?? "";
-            if (analyzeResult.status !== 0 || analyzeResult.error) {
-                console.error("[ZeroFalse] CodeQL analysis FAILED");
-                console.error(`[ZeroFalse]   stdout: ${anStdout}`);
-                console.error(`[ZeroFalse]   stderr: ${anStderr}`);
-                const detail = analyzeResult.error?.message || anStderr || anStdout || "unknown error";
-                throw new Error(`CodeQL analysis failed: ${detail.slice(0, 500)}`);
+        });
+    };
+    // ------------------------------------------------------------------
+    // Step 0: Detect CodeQL executable
+    // ------------------------------------------------------------------
+    const codeqlExe = detectCodeQL();
+    if (!codeqlExe) {
+        const msg = "CodeQL was not found. Please install it and ensure it is on PATH, " +
+            "or place it at C:\\codeql\\codeql.exe.";
+        vscode.window.showErrorMessage(`ZeroFalse: ${msg}`);
+        throw new Error(msg);
+    }
+    console.log(`[ZeroFalse] Using CodeQL executable: ${codeqlExe}`);
+    const dbPath = path.join(workspacePath, "db-codeql");
+    const sarifPath = path.join(workspacePath, "results.sarif");
+    // ------------------------------------------------------------------
+    // Step 1: Cleanup — remove stale artifacts before running
+    // ------------------------------------------------------------------
+    if (extension_1.cancellationController.isCancelled)
+        throw new Error("CancelledByUser");
+    progress.report({ message: "Cleaning up previous analysis artifacts…" });
+    if (fs.existsSync(dbPath)) {
+        console.log(`[ZeroFalse] Removing existing CodeQL database at: ${dbPath}`);
+        fs.rmSync(dbPath, { recursive: true, force: true });
+    }
+    if (fs.existsSync(sarifPath)) {
+        console.log(`[ZeroFalse] Removing existing SARIF file at: ${sarifPath}`);
+        fs.unlinkSync(sarifPath);
+    }
+    // ------------------------------------------------------------------
+    // Step 2: Create CodeQL database
+    //
+    // IMPORTANT: Use spawnSync with an argument ARRAY, not execSync with a
+    // joined string. When execSync builds "--command=mvn clean compile -Dspotless.skip=true" as
+    // a single string the shell splits it into three tokens at the spaces,
+    // giving CodeQL three unmatched positional arguments. spawnSync passes
+    // each element directly to the OS without any shell interpretation, so
+    // the value of --command stays intact as "mvn clean compile".
+    // ------------------------------------------------------------------
+    progress.report({ message: "Creating CodeQL database (running mvn clean compile)…" });
+    console.log(`[ZeroFalse] Starting CodeQL database creation in: ${workspacePath}`);
+    const dbCreateArgs = [
+        "database", "create",
+        dbPath,
+        "--language=java",
+        "--overwrite",
+        "--ram=4096", // Allow up to 4GB RAM
+        "--threads=0",
+    ];
+    // If the project has a pom.xml use Maven; otherwise let CodeQL autobuild.
+    // NOTE: Do NOT wrap with "cmd /c" here — CodeQL's Java extractor sets up
+    // JAVA_TOOL_OPTIONS / tracer hooks before invoking the build command, and
+    // an extra cmd.exe layer breaks that environment injection, causing the
+    // pre-finalize step to fail because no class files are traced.
+    if (fs.existsSync(path.join(workspacePath, "pom.xml"))) {
+        dbCreateArgs.push("--command");
+        dbCreateArgs.push("mvn clean compile -Dspotless.skip=true -T 1C");
+    }
+    console.log(`[ZeroFalse] DB create: ${codeqlExe} ${dbCreateArgs.join(" ")}`);
+    try {
+        const { stdout: dbStdout, stderr: dbStderr } = await spawnAsync(codeqlExe, dbCreateArgs, { cwd: workspacePath }, 600000);
+        // Always write full output to the Output Channel for diagnostics
+        const ch = getOutputChannel();
+        ch.appendLine("\n=== CodeQL database create ===");
+        ch.appendLine(`Command: ${codeqlExe} ${dbCreateArgs.join(" ")}`);
+        ch.appendLine(`CWD: ${workspacePath}`);
+        if (dbStdout.trim()) {
+            ch.appendLine("[stdout]\n" + dbStdout);
+        }
+        if (dbStderr.trim()) {
+            ch.appendLine("[stderr]\n" + dbStderr);
+        }
+        ch.appendLine(`Exit code: 0`);
+        console.log("[ZeroFalse] CodeQL database creation completed.");
+        if (dbStdout.trim()) {
+            console.log(`[ZeroFalse] DB stdout: ${dbStdout.trim()}`);
+        }
+    }
+    catch (err) {
+        if (err.message === "CancelledByUser" || extension_1.cancellationController.isCancelled) {
+            console.log(`[ZeroFalse] Cleaning up partially created CodeQL database at: ${dbPath}`);
+            try {
+                if (fs.existsSync(dbPath))
+                    fs.rmSync(dbPath, { recursive: true, force: true });
             }
-            console.log("[ZeroFalse] CodeQL analysis completed.");
-        }
-        catch (err) {
-            if (err.message.startsWith("CodeQL analysis failed:")) {
-                throw err;
+            catch (cleanupErr) {
+                console.error(`[ZeroFalse] Failed to delete partial db: ${cleanupErr}`);
             }
-            throw new Error(`CodeQL analysis failed: ${err.message}`);
+            throw new Error("CancelledByUser");
         }
-        // ------------------------------------------------------------------
-        // Step 4: Validate SARIF file exists
-        // ------------------------------------------------------------------
-        if (!fs.existsSync(sarifPath)) {
-            const msg = "CodeQL analysis completed but no SARIF file was generated. " +
-                "Check that the query pack is compatible with your CodeQL version.";
-            vscode.window.showErrorMessage(`ZeroFalse: ${msg}`);
-            throw new Error(msg);
+        const ch = getOutputChannel();
+        ch.appendLine("\n=== CodeQL database create FAILED ===");
+        if (err.stdout)
+            ch.appendLine("[stdout]\n" + err.stdout);
+        if (err.stderr)
+            ch.appendLine("[stderr]\n" + err.stderr);
+        ch.show(true);
+        console.error("[ZeroFalse] CodeQL database creation FAILED");
+        const detail = err.stderr || err.stdout || err.message;
+        throw new Error(`CodeQL database creation failed: ${detail.slice(0, 2000)}`);
+    }
+    // ------------------------------------------------------------------
+    // Step 3: Analyze — codeql database analyze
+    // ------------------------------------------------------------------
+    // Dynamically resolve the best available security suite for the
+    // installed CodeQL version (avoids hard-coded paths that break
+    // across different qlpack layouts).
+    if (extension_1.cancellationController.isCancelled)
+        throw new Error("CancelledByUser");
+    const javaSuite = resolveJavaSecuritySuite(codeqlExe);
+    progress.report({ message: `Running CodeQL security queries (${javaSuite.split(":").pop()})…` });
+    console.log(`[ZeroFalse] Starting CodeQL analysis with suite: ${javaSuite}`);
+    const analyzeArgs = [
+        "database", "analyze",
+        dbPath,
+        javaSuite,
+        "--format=sarif-latest",
+        "--output", sarifPath,
+        "--download",
+        "--ram=4096", // Allow up to 4GB RAM to prevent swapping
+        "--threads=0", // Use all available cores to maximize speed
+    ];
+    console.log(`[ZeroFalse] Analyze: ${codeqlExe} ${analyzeArgs.join(" ")}`);
+    try {
+        await spawnAsync(codeqlExe, analyzeArgs, { cwd: workspacePath }, 1200000);
+        console.log("[ZeroFalse] CodeQL analysis completed.");
+    }
+    catch (err) {
+        if (err.message === "CancelledByUser" || extension_1.cancellationController.isCancelled) {
+            console.log(`[ZeroFalse] Cleaning up CodeQL database after cancellation at: ${dbPath}`);
+            try {
+                if (fs.existsSync(dbPath))
+                    fs.rmSync(dbPath, { recursive: true, force: true });
+                if (fs.existsSync(sarifPath))
+                    fs.unlinkSync(sarifPath);
+            }
+            catch (cleanupErr) {
+                console.error(`[ZeroFalse] Failed to delete partial db: ${cleanupErr}`);
+            }
+            throw new Error("CancelledByUser");
         }
-        const sarifBytes = fs.statSync(sarifPath).size;
-        console.log(`[ZeroFalse] SARIF file generated: ${sarifPath}  (${sarifBytes} bytes)`);
-        return sarifPath;
-    });
+        console.error("[ZeroFalse] CodeQL analysis FAILED");
+        const detail = err.stderr || err.stdout || err.message;
+        throw new Error(`CodeQL analysis failed: ${detail.slice(0, 500)}`);
+    }
+    // ------------------------------------------------------------------
+    // Step 4: Validate SARIF file exists
+    // ------------------------------------------------------------------
+    if (!fs.existsSync(sarifPath)) {
+        const msg = "CodeQL analysis completed but no SARIF file was generated. " +
+            "Check that the query pack is compatible with your CodeQL version.";
+        vscode.window.showErrorMessage(`ZeroFalse: ${msg}`);
+        throw new Error(msg);
+    }
+    const sarifBytes = fs.statSync(sarifPath).size;
+    console.log(`[ZeroFalse] SARIF file generated: ${sarifPath}  (${sarifBytes} bytes)`);
+    return sarifPath;
 }
 // ---------------------------------------------------------------------------
 // Internal: HTTP file download with redirect support

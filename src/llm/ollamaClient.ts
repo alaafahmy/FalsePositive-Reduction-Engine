@@ -234,3 +234,46 @@ export async function verifyOllamaReachable(): Promise<boolean> {
     req.end();
   });
 }
+
+/**
+ * Force Ollama to unload the model from memory.
+ * This sends a lightweight request with keep_alive: 0.
+ */
+export async function unloadOllamaModel(): Promise<void> {
+  if (USE_MOCK_LLM) return;
+
+  return new Promise<void>((resolve, reject) => {
+    const requestBody = {
+      model: MODEL_NAME,
+      keep_alive: 0,
+    };
+
+    const bodyString = JSON.stringify(requestBody);
+
+    const options: import("http").RequestOptions = {
+      hostname: OLLAMA_HOST,
+      port: OLLAMA_PORT,
+      path: "/api/generate",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(bodyString),
+      },
+    };
+
+    const req = import("http").then(http => {
+      const request = http.request(options, (res) => {
+        res.resume(); // drain response
+        resolve();
+      });
+
+      request.on("error", (err) => {
+        console.error("[ZeroFalse] Failed to unload Ollama model:", err);
+        resolve(); // Don't throw, just resolve so we don't block cleanup
+      });
+
+      request.write(bodyString);
+      request.end();
+    });
+  });
+}

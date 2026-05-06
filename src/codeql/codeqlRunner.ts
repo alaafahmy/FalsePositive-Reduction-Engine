@@ -30,7 +30,7 @@ import * as path from 'path';
 import * as fs from 'fs';
 import * as https from 'https';
 import * as os from 'os';
-
+import { cancellationController } from '../extension';
 
 // ---------------------------------------------------------------------------
 // Module-level: path set by installCodeQL() for the remainder of the session.
@@ -265,17 +265,107 @@ function resolveJavaSecuritySuite(codeqlExe: string): string {
  *   6. Return absolute path to results.sarif.
  *
  * @param workspacePath - Absolute path to the root of the Java project.
+ * @param isCancelled - Optional callback to check for cancellation
  * @returns Absolute path to the generated results.sarif file.
  * @throws Error with descriptive message on any failure.
  */
-export async function runCodeQLAnalysis(workspacePath: string): Promise<string> {
-  return await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ZeroFalse: Running CodeQL Analysis",
-      cancellable: false,
-    },
-    async (progress) => {
+export async function runCodeQLAnalysis(
+  workspacePath: string, 
+  progress: vscode.Progress<{ message?: string; increment?: number }>
+): Promise<string> {
+
+  // Helper to run child processes asynchronously with cancellation support
+  const spawnAsync = (command: string, args: string[], options: child_process.SpawnOptions, timeoutMs: number): Promise<{stdout: string, stderr: string}> => {
+    return new Promise((resolve, reject) => {
+      if (cancellationController.isCancelled) {
+        return reject(new Error("CancelledByUser"));
+      }
+
+          const cp = child_process.spawn(command, args, options);
+          let stdout = "";
+          let stderr = "";
+          
+          cp.stdout?.on('data', data => stdout += data.toString());
+          cp.stderr?.on('data', data => stderr += data.toString());
+
+          let isTerminating = false;
+
+          const handleCancel = async () => {
+            if (isTerminating) return;
+            isTerminating = true;
+            console.log(`[ZeroFalse] Cancelling CodeQL process: ${command}`);
+
+            if (cp.pid && cp.exitCode === null && cp.signalCode === null) {
+              try {
+                if (os.platform() === 'win32') {
+                  // Safe termination first (without /F)
+                  child_process.execSync(`taskkill /pid ${cp.pid} /T`, { stdio: 'ignore' });
+                } else {
+                  cp.kill('SIGTERM');
+                }
+              } catch (e) {
+                // Ignore kill errors
+              }
+
+              // Wait up to 3 seconds for graceful shutdown
+              for (let i = 0; i < 30; i++) {
+                if (cp.exitCode !== null || cp.signalCode !== null) break;
+                await new Promise(r => setTimeout(r, 100));
+              }
+
+              // Force kill if still alive
+              if (cp.exitCode === null && cp.signalCode === null) {
+                try {
+                  if (os.platform() === 'win32') {
+                    child_process.execSync(`taskkill /pid ${cp.pid} /T /F`, { stdio: 'ignore' });
+                  } else {
+                    cp.kill('SIGKILL');
+                  }
+                } catch (e) {
+                  // Ignore kill errors
+                }
+              }
+            }
+          };
+
+          const cancelDisposable = cancellationController.onCancellationRequested(handleCancel);
+          
+          const timeoutId = setTimeout(() => {
+            cancelDisposable.dispose();
+            handleCancel().finally(() => {
+              reject(new Error(`Timeout after ${timeoutMs}ms`));
+            });
+          }, timeoutMs);
+          
+          cp.on('close', code => {
+            clearTimeout(timeoutId);
+            cancelDisposable.dispose();
+            
+            if (isTerminating || cancellationController.isCancelled) {
+              reject(new Error("CancelledByUser"));
+            } else if (code === 0) {
+              resolve({stdout, stderr});
+            } else {
+              const err = new Error(`Command failed with exit code ${code}`);
+              (err as any).stdout = stdout;
+              (err as any).stderr = stderr;
+              (err as any).status = code;
+              reject(err);
+            }
+          });
+          
+          cp.on('error', err => {
+            clearTimeout(timeoutId);
+            cancelDisposable.dispose();
+            if (isTerminating || cancellationController.isCancelled) {
+              reject(new Error("CancelledByUser"));
+            } else {
+              reject(err);
+            }
+          });
+        });
+      };
+
 
       // ------------------------------------------------------------------
       // Step 0: Detect CodeQL executable
@@ -295,6 +385,7 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
       // ------------------------------------------------------------------
       // Step 1: Cleanup — remove stale artifacts before running
       // ------------------------------------------------------------------
+      if (cancellationController.isCancelled) throw new Error("CancelledByUser");
       progress.report({ message: "Cleaning up previous analysis artifacts…" });
 
       if (fs.existsSync(dbPath)) {
@@ -325,6 +416,7 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
         dbPath,
         "--language=java",
         "--overwrite",
+        "--ram=4096",      // Allow up to 4GB RAM
         "--threads=0",
       ];
 
@@ -341,14 +433,7 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
       console.log(`[ZeroFalse] DB create: ${codeqlExe} ${dbCreateArgs.join(" ")}`);
 
       try {
-        const dbResult = child_process.spawnSync(codeqlExe, dbCreateArgs, {
-          cwd: workspacePath,
-          timeout: 600_000,   // 10 minutes
-          stdio: "pipe",
-        });
-
-        const dbStdout = dbResult.stdout?.toString() ?? "";
-        const dbStderr = dbResult.stderr?.toString() ?? "";
+        const { stdout: dbStdout, stderr: dbStderr } = await spawnAsync(codeqlExe, dbCreateArgs, { cwd: workspacePath }, 600_000);
 
         // Always write full output to the Output Channel for diagnostics
         const ch = getOutputChannel();
@@ -357,23 +442,28 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
         ch.appendLine(`CWD: ${workspacePath}`);
         if (dbStdout.trim()) { ch.appendLine("[stdout]\n" + dbStdout); }
         if (dbStderr.trim()) { ch.appendLine("[stderr]\n" + dbStderr); }
-        ch.appendLine(`Exit code: ${dbResult.status}`);
-
-        if (dbResult.status !== 0 || dbResult.error) {
-          ch.show(true); // bring Output panel to front on failure
-          console.error("[ZeroFalse] CodeQL database creation FAILED");
-          console.error(`[ZeroFalse]   stdout: ${dbStdout.trim()}`);
-          console.error(`[ZeroFalse]   stderr: ${dbStderr.trim()}`);
-          const detail = dbResult.error?.message || dbStderr.trim() || dbStdout.trim() || "unknown error";
-          throw new Error(`CodeQL database creation failed: ${detail.slice(0, 2000)}`);
-        }
+        ch.appendLine(`Exit code: 0`);
 
         console.log("[ZeroFalse] CodeQL database creation completed.");
         if (dbStdout.trim()) { console.log(`[ZeroFalse] DB stdout: ${dbStdout.trim()}`); }
       } catch (err: any) {
-        // Re-throw errors we already wrapped; wrap unexpected ones
-        if (err.message.startsWith("CodeQL database creation failed:")) { throw err; }
-        throw new Error(`CodeQL database creation failed: ${err.message}`);
+        if (err.message === "CancelledByUser" || cancellationController.isCancelled) {
+          console.log(`[ZeroFalse] Cleaning up partially created CodeQL database at: ${dbPath}`);
+          try {
+            if (fs.existsSync(dbPath)) fs.rmSync(dbPath, { recursive: true, force: true });
+          } catch (cleanupErr) {
+            console.error(`[ZeroFalse] Failed to delete partial db: ${cleanupErr}`);
+          }
+          throw new Error("CancelledByUser");
+        }
+        const ch = getOutputChannel();
+        ch.appendLine("\n=== CodeQL database create FAILED ===");
+        if (err.stdout) ch.appendLine("[stdout]\n" + err.stdout);
+        if (err.stderr) ch.appendLine("[stderr]\n" + err.stderr);
+        ch.show(true);
+        console.error("[ZeroFalse] CodeQL database creation FAILED");
+        const detail = err.stderr || err.stdout || err.message;
+        throw new Error(`CodeQL database creation failed: ${detail.slice(0, 2000)}`);
       }
 
       // ------------------------------------------------------------------
@@ -383,6 +473,7 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
       // Dynamically resolve the best available security suite for the
       // installed CodeQL version (avoids hard-coded paths that break
       // across different qlpack layouts).
+      if (cancellationController.isCancelled) throw new Error("CancelledByUser");
       const javaSuite = resolveJavaSecuritySuite(codeqlExe);
       progress.report({ message: `Running CodeQL security queries (${javaSuite.split(":").pop()})…` });
       console.log(`[ZeroFalse] Starting CodeQL analysis with suite: ${javaSuite}`);
@@ -400,27 +491,22 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
       console.log(`[ZeroFalse] Analyze: ${codeqlExe} ${analyzeArgs.join(" ")}`);
 
       try {
-        const analyzeResult = child_process.spawnSync(codeqlExe, analyzeArgs, {
-          cwd: workspacePath,
-          timeout: 1_200_000,   // 20 minutes
-          stdio: "pipe",
-        });
-
-        const anStdout = analyzeResult.stdout?.toString().trim() ?? "";
-        const anStderr = analyzeResult.stderr?.toString().trim() ?? "";
-
-        if (analyzeResult.status !== 0 || analyzeResult.error) {
-          console.error("[ZeroFalse] CodeQL analysis FAILED");
-          console.error(`[ZeroFalse]   stdout: ${anStdout}`);
-          console.error(`[ZeroFalse]   stderr: ${anStderr}`);
-          const detail = analyzeResult.error?.message || anStderr || anStdout || "unknown error";
-          throw new Error(`CodeQL analysis failed: ${detail.slice(0, 500)}`);
-        }
-
+        await spawnAsync(codeqlExe, analyzeArgs, { cwd: workspacePath }, 1_200_000);
         console.log("[ZeroFalse] CodeQL analysis completed.");
       } catch (err: any) {
-        if (err.message.startsWith("CodeQL analysis failed:")) { throw err; }
-        throw new Error(`CodeQL analysis failed: ${err.message}`);
+        if (err.message === "CancelledByUser" || cancellationController.isCancelled) {
+          console.log(`[ZeroFalse] Cleaning up CodeQL database after cancellation at: ${dbPath}`);
+          try {
+            if (fs.existsSync(dbPath)) fs.rmSync(dbPath, { recursive: true, force: true });
+            if (fs.existsSync(sarifPath)) fs.unlinkSync(sarifPath);
+          } catch (cleanupErr) {
+            console.error(`[ZeroFalse] Failed to delete partial db: ${cleanupErr}`);
+          }
+          throw new Error("CancelledByUser");
+        }
+        console.error("[ZeroFalse] CodeQL analysis FAILED");
+        const detail = err.stderr || err.stdout || err.message;
+        throw new Error(`CodeQL analysis failed: ${detail.slice(0, 500)}`);
       }
 
       // ------------------------------------------------------------------
@@ -437,8 +523,6 @@ export async function runCodeQLAnalysis(workspacePath: string): Promise<string> 
       console.log(`[ZeroFalse] SARIF file generated: ${sarifPath}  (${sarifBytes} bytes)`);
 
       return sarifPath;
-    }
-  );
 }
 
 

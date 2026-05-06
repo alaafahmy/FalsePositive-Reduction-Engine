@@ -53,6 +53,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.USE_MOCK_LLM = void 0;
 exports.invokeOllama = invokeOllama;
 exports.verifyOllamaReachable = verifyOllamaReachable;
+exports.unloadOllamaModel = unloadOllamaModel;
 const http = __importStar(require("http"));
 // Toggle for Mock LLM Mode
 exports.USE_MOCK_LLM = false;
@@ -207,6 +208,43 @@ async function verifyOllamaReachable() {
             reject(new Error(`Local LLM service is not running: ${err.message}`));
         });
         req.end();
+    });
+}
+/**
+ * Force Ollama to unload the model from memory.
+ * This sends a lightweight request with keep_alive: 0.
+ */
+async function unloadOllamaModel() {
+    if (exports.USE_MOCK_LLM)
+        return;
+    return new Promise((resolve, reject) => {
+        const requestBody = {
+            model: MODEL_NAME,
+            keep_alive: 0,
+        };
+        const bodyString = JSON.stringify(requestBody);
+        const options = {
+            hostname: OLLAMA_HOST,
+            port: OLLAMA_PORT,
+            path: "/api/generate",
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Content-Length": Buffer.byteLength(bodyString),
+            },
+        };
+        const req = Promise.resolve().then(() => __importStar(require("http"))).then(http => {
+            const request = http.request(options, (res) => {
+                res.resume(); // drain response
+                resolve();
+            });
+            request.on("error", (err) => {
+                console.error("[ZeroFalse] Failed to unload Ollama model:", err);
+                resolve(); // Don't throw, just resolve so we don't block cleanup
+            });
+            request.write(bodyString);
+            request.end();
+        });
     });
 }
 //# sourceMappingURL=ollamaClient.js.map

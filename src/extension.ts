@@ -30,7 +30,7 @@ import { parseSarif } from "./sarif/parser";
 import { extractContext } from "./pipeline/contextExtractor";
 import { enrichAlert } from "./pipeline/cweEnricher";
 import { buildPrompt } from "./pipeline/promptBuilder";
-import { invokeOllama, verifyOllamaReachable } from "./llm/ollamaClient";
+import { invokeOllama, verifyOllamaReachable, unloadOllamaModel } from "./llm/ollamaClient";
 import { validateLLMOutput, deriveClassification } from "./llm/outputValidator";
 import { ResultsViewProvider } from "./ui/resultsViewProvider";
 import { initDecorations, applyAnnotations, clearAllAnnotations } from "./ui/inlineAnnotations";
@@ -48,7 +48,23 @@ const auditTrail = new Map<
   { prompt: string; rawResponse: string }
 >();
 
-export let cancelRequested = false;
+export const cancellationController = {
+  _cancelled: false,
+  _listeners: [] as (() => void)[],
+  get isCancelled() { return this._cancelled; },
+  cancel() { 
+    this._cancelled = true; 
+    this._listeners.forEach(l => l());
+  },
+  onCancellationRequested(listener: () => void) {
+    this._listeners.push(listener);
+    return { dispose: () => { this._listeners = this._listeners.filter(l => l !== listener); } };
+  },
+  reset() { 
+    this._cancelled = false; 
+    this._listeners = [];
+  }
+};
 
 // ---- Extension Activation ----
 
@@ -105,7 +121,8 @@ export async function activate(
   const cancelCmd = vscode.commands.registerCommand(
     "zerofalse.cancel",
     () => {
-      cancelRequested = true;
+      cancellationController.cancel();
+      unloadOllamaModel();
     }
   );
 
@@ -113,6 +130,7 @@ export async function activate(
     "zerofalse.clearResults",
     () => {
       provider.clearResults();
+      unloadOllamaModel();
     }
   );
 
@@ -122,6 +140,7 @@ export async function activate(
 
 export function deactivate(): void {
   auditTrail.clear();
+  unloadOllamaModel();
 }
 
 // ---- Main Pipeline Orchestrator ----
@@ -131,139 +150,119 @@ async function runZeroFalsePipeline(
   context: vscode.ExtensionContext,
   provider: ResultsViewProvider
 ): Promise<void> {
-  cancelRequested = false;
+  cancellationController.reset();
   provider.clearResults();
   provider.setRunningState(true);
 
-  cancelRequested = false;
-  provider.clearResults();
-  provider.setRunningState(true);
-
-  try {
-    // ------------------------------------------------------------------
-    // Phase 1: Resolve SARIF path
-    //   Case A: User right-clicked a .sarif file → use it directly.
-    //   Case B: No file provided → run CodeQL to generate the SARIF.
-    // ------------------------------------------------------------------
-
-  let sarifPath: string | undefined;
-  let workspaceRoot: string;
-
-  if (fileUri && fileUri.fsPath.endsWith(".sarif")) {
-    // ---- Case A: Direct SARIF file ----
-    sarifPath = fileUri.fsPath;
-    workspaceRoot = resolveWorkspaceRoot(sarifPath);
-    console.log(`[ZeroFalse] Using provided SARIF file: ${sarifPath}`);
-
-  } else {
-    // ---- Case B: Run CodeQL pipeline ----
-
-    // Validate that a workspace is open
-    if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
-      vscode.window.showErrorMessage(
-        "ZeroFalse: Please open a workspace folder to run analysis."
-      );
-      return;
-    }
-    workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
-
-    // Step 1: Detect CodeQL — abort with a clear message if absent
-    const codeqlPath = detectCodeQL();
-    if (!codeqlPath) {
-      vscode.window.showErrorMessage(
-        "ZeroFalse: CodeQL was not found. " +
-          "Install the CodeQL CLI and ensure 'codeql' is on PATH, " +
-          "or place it at C:\\codeql\\codeql.exe."
-      );
-      console.error("[ZeroFalse] Aborting — CodeQL not found.");
-      return; // Safe stop
-    }
-    console.log(`[ZeroFalse] CodeQL found at: ${codeqlPath}`);
-
-    // Step 2: Run CodeQL database create + analyze
-    try {
-      sarifPath = await runCodeQLAnalysis(workspaceRoot);
-    } catch (err: any) {
-      vscode.window.showErrorMessage(`ZeroFalse: ${err.message}`);
-      return;
-    }
-  }
-
-  if (!sarifPath) {
-    console.error("[ZeroFalse] sarifPath is undefined after resolution — aborting.");
-    return;
-  }
-
-  // ------------------------------------------------------------------
-  // Phase 2: Read & Parse SARIF
-  // ------------------------------------------------------------------
-
-  let sarif: SarifReport;
-  try {
-    const raw = fs.readFileSync(sarifPath, "utf8");
-    sarif = JSON.parse(raw) as SarifReport;
-    console.log(`[ZeroFalse] SARIF file read successfully: ${sarifPath}`);
-  } catch (err) {
-    vscode.window.showErrorMessage(
-      `ZeroFalse: Failed to read/parse SARIF file: ${(err as Error).message}`
-    );
-    return;
-  }
-
-  let alerts: Alert[];
-  try {
-    alerts = parseSarif(sarif, workspaceRoot);
-  } catch (err) {
-    vscode.window.showErrorMessage(
-      `ZeroFalse: SARIF parsing failed: ${(err as Error).message}`
-    );
-    return;
-  }
-
-  console.log(`[ZeroFalse] SARIF parsed — ${alerts.length} alert(s) found.`);
-
-  // ---- SARIF Empty: stop cleanly, no synthetic data ----
-  if (alerts.length === 0) {
-    console.log("[ZeroFalse] CodeQL returned 0 alerts — nothing to adjudicate.");
-    vscode.window.showInformationMessage(
-      "ZeroFalse: No security alerts were found by CodeQL in this project."
-    );
-    return;
-  }
-
-  // ------------------------------------------------------------------
-  // Phase 3: Verify LLM is reachable before processing alerts
-  // ------------------------------------------------------------------
-  try {
-    await verifyOllamaReachable();
-  } catch {
-    vscode.window.showErrorMessage(
-      "ZeroFalse: Local LLM service is not reachable. " +
-        "Start Ollama with `ollama serve` and pull llama3:8b, or enable mock mode."
-    );
-    return;
-  }
-
-  // ------------------------------------------------------------------
-  // Phase 4: Per-alert LLM adjudication pipeline
-  // ------------------------------------------------------------------
   const results: FinalResult[] = [];
-  auditTrail.clear();
+  let finalSarifPath: string = "";
+  let finalWorkspaceRoot: string = "";
 
-  await vscode.window.withProgress(
-    {
-      location: vscode.ProgressLocation.Notification,
-      title: "ZeroFalse",
-      cancellable: false,
-    },
-    async (progress) => {
-      const total = alerts.length;
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "ZeroFalse Pipeline",
+        cancellable: true,
+      },
+      async (progress, token) => {
+        const cancelDisposable = token.onCancellationRequested(() => {
+          cancellationController.cancel();
+        });
 
-      for (let i = 0; i < total; i++) {
-        if (cancelRequested) {
-          console.log('[ZeroFalse] Analysis cancelled by user.');
-          break;
-        }
+        try {
+          // ------------------------------------------------------------------
+          // Phase 1: Resolve SARIF path
+          // ------------------------------------------------------------------
+          let sarifPath: string | undefined;
+          let workspaceRoot: string;
+
+          if (fileUri && fileUri.fsPath.endsWith(".sarif")) {
+            sarifPath = fileUri.fsPath;
+            workspaceRoot = resolveWorkspaceRoot(sarifPath);
+            console.log(`[ZeroFalse] Using provided SARIF file: ${sarifPath}`);
+          } else {
+            if (!vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
+              vscode.window.showErrorMessage("ZeroFalse: Please open a workspace folder to run analysis.");
+              return;
+            }
+            workspaceRoot = vscode.workspace.workspaceFolders[0].uri.fsPath;
+
+            const codeqlPath = detectCodeQL();
+            if (!codeqlPath) {
+              vscode.window.showErrorMessage(
+                "ZeroFalse: CodeQL was not found. Install the CodeQL CLI and ensure 'codeql' is on PATH, or place it at C:\\codeql\\codeql.exe."
+              );
+              return;
+            }
+            console.log(`[ZeroFalse] CodeQL found at: ${codeqlPath}`);
+
+            try {
+              sarifPath = await runCodeQLAnalysis(workspaceRoot, progress);
+            } catch (err: any) {
+              if (err.message === "CancelledByUser") {
+                console.log("[ZeroFalse] CodeQL analysis was cancelled by the user.");
+                return;
+              }
+              vscode.window.showErrorMessage(`ZeroFalse: ${err.message}`);
+              return;
+            }
+          }
+
+          if (!sarifPath || cancellationController.isCancelled) return;
+          finalSarifPath = sarifPath;
+          finalWorkspaceRoot = workspaceRoot;
+
+          // ------------------------------------------------------------------
+          // Phase 2: Read & Parse SARIF
+          // ------------------------------------------------------------------
+          let sarif: SarifReport;
+          try {
+            const raw = fs.readFileSync(sarifPath, "utf8");
+            sarif = JSON.parse(raw) as SarifReport;
+          } catch (err) {
+            vscode.window.showErrorMessage(`ZeroFalse: Failed to read/parse SARIF file: ${(err as Error).message}`);
+            return;
+          }
+
+          let alerts: Alert[];
+          try {
+            alerts = parseSarif(sarif, workspaceRoot);
+          } catch (err) {
+            vscode.window.showErrorMessage(`ZeroFalse: SARIF parsing failed: ${(err as Error).message}`);
+            return;
+          }
+
+          if (alerts.length === 0) {
+            vscode.window.showInformationMessage("ZeroFalse: No security alerts were found by CodeQL in this project.");
+            return;
+          }
+
+          if (cancellationController.isCancelled) return;
+
+          // ------------------------------------------------------------------
+          // Phase 3: Verify LLM is reachable
+          // ------------------------------------------------------------------
+          try {
+            await verifyOllamaReachable();
+          } catch {
+            vscode.window.showErrorMessage("ZeroFalse: Local LLM service is not reachable. Start Ollama with `ollama serve` or enable mock mode.");
+            return;
+          }
+
+          if (cancellationController.isCancelled) return;
+
+          // ------------------------------------------------------------------
+          // Phase 4: Per-alert LLM adjudication pipeline
+          // ------------------------------------------------------------------
+          auditTrail.clear();
+          const total = alerts.length;
+
+          for (let i = 0; i < total; i++) {
+            if (cancellationController.isCancelled) {
+              console.log('[ZeroFalse] Analysis cancelled by user.');
+              break;
+            }
         const alert = alerts[i];
         const stepLabel = `Adjudicating alert ${i + 1}/${total}: ${alert.ruleId}`;
         progress.report({ message: stepLabel, increment: (1 / total) * 100 });
@@ -283,7 +282,7 @@ async function runZeroFalsePipeline(
 
           // Step D: LLM adjudication (independent per alert, no batching)
           console.log(`[ZeroFalse] Invoking LLM for alert ${alert.id}…`);
-          const rawResponse = await invokeOllama(prompt, () => cancelRequested);
+          const rawResponse = await invokeOllama(prompt, () => cancellationController.isCancelled);
           console.log(`[ZeroFalse] LLM response received for alert ${alert.id}.`);
 
           // Store audit trail entry
@@ -321,13 +320,22 @@ async function runZeroFalsePipeline(
             `ZeroFalse: Alert ${alert.id} (${alert.ruleId}) could not be adjudicated: ${errMsg}`
           );
         }
+        }
+      } finally {
+        cancelDisposable.dispose();
       }
+    });
+
+    if (cancellationController.isCancelled) {
+      console.log("[ZeroFalse] Pipeline cancelled, exiting.");
+      return;
     }
-  );
 
   // ------------------------------------------------------------------
   // Phase 5: Display results
   // ------------------------------------------------------------------
+  if (cancellationController.isCancelled || !finalSarifPath || !finalWorkspaceRoot) return;
+
   if (results.length === 0) {
     vscode.window.showWarningMessage(
       "ZeroFalse: No alerts could be successfully adjudicated. " +
@@ -339,11 +347,11 @@ async function runZeroFalsePipeline(
   console.log(`[ZeroFalse] Pipeline complete — ${results.length} result(s) ready for display.`);
 
   // Show results in the sidebar panel
-  provider.updateResults(results, sarifPath);
+  provider.updateResults(results, finalSarifPath);
   vscode.commands.executeCommand("zerofalse.resultsView.focus");
 
   // Apply inline gutter annotations to source files
-  await applyAnnotations(results, workspaceRoot);
+  await applyAnnotations(results, finalWorkspaceRoot);
 
   vscode.window.showInformationMessage(
     `ZeroFalse: Analysis complete. ${results.length} alert(s) classified — ` +
@@ -352,6 +360,8 @@ async function runZeroFalsePipeline(
   );
   } finally {
     provider.setRunningState(false);
+    // Unload Ollama model to free up RAM once analysis is complete or aborted
+    unloadOllamaModel();
   }
 }
 
