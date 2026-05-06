@@ -1,17 +1,3 @@
-Listed directory last-ext
-Viewed package.json:1-69
-Listed directory src
-Viewed extension.ts:1-391
-Viewed types.ts:1-122
-Listed directory codeql
-Listed directory llm
-Listed directory pipeline
-Listed directory sarif
-Listed directory ui
-Viewed codeqlRunner.ts:1-565
-Viewed ollamaClient.ts:1-280
-Viewed outputValidator.ts:1-200
-Viewed dashboardPanel.ts:1-657
 
 # ZeroFalse — SAST False Positive Reduction
 
